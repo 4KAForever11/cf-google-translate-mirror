@@ -1,7 +1,7 @@
 {
   "name": "cf-google-translate-mirror",
-  "version": "1.0.0",
-  "description": "Google Translate mirror powered by Cloudflare Workers — web UI + JSON API, no API key required. / 基于 Cloudflare Workers 的谷歌翻译镜像站，网页 + JSON API，无需 API Key。",
+  "version": "1.1.0",
+  "description": "Single-file Google Translate mirror for Cloudflare Workers — paste workers.js into the dashboard and deploy. Web UI + JSON API, no API key required. / 单文件谷歌翻译镜像站，粘贴 workers.js 即可部署到 Cloudflare Workers，网页 + JSON API，无需 API Key。",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -23,8 +23,9 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "test": "node --test",
-    "lint": "node --check src/index.js && node --check src/google.js && node --check src/languages.js",
+    "lint": "node --check workers.js && node --check test/workers.test.js && node --check scripts/smoke.mjs && node --check scripts/mock-upstream.mjs",
     "build:check": "wrangler deploy --dry-run --outdir=dist",
+    "mock": "node scripts/mock-upstream.mjs",
     "smoke": "node scripts/smoke.mjs"
   },
   "devDependencies": {
