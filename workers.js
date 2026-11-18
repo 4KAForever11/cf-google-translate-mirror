@@ -19,8 +19,11 @@
  *   GET  /api                 -> endpoint index
  *
  * No API key, no database, no storage: text is proxied in-request and discarded.
- * Upstream: the public Google Translate web endpoint (client=gtx). For testing
- * set env UPSTREAM_BASE to a mock server (see scripts/mock-upstream.mjs).
+ * Upstream: public Google Translate endpoints tried as a fallback chain
+ * (client=at -> dict-chrome-ex -> client=gtx; the gtx endpoint rate-limits
+ * datacenter IPs with HTTP 429, which is why the chain exists). Browser-like
+ * request headers + one backoff retry per endpoint. For testing set env
+ * UPSTREAM_BASE to a mock server (see scripts/mock-upstream.mjs).
  *
  * Env vars (all optional, [vars] in wrangler.toml):
  *   MAX_TEXT_LENGTH (5000)  UPSTREAM_TIMEOUT_MS (10000)  CHUNK_SIZE (1000)  UPSTREAM_BASE
@@ -36,7 +39,7 @@ const DEFAULT_UPSTREAM_BASE = 'https://translate.googleapis.com';
 const DEFAULT_MAX_TEXT_LENGTH = 5000;
 const DEFAULT_CHUNK_SIZE = 1000;
 const DEFAULT_TIMEOUT_MS = 10000;
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 
 /** Error carrying an HTTP status and a stable machine code for API clients. */
 class HttpError extends Error {
@@ -68,14 +71,16 @@ function normalizeLangCode(raw, { allowAuto = false } = {}) {
     .join('-');
 }
 
-/** Build the upstream GET URL for one text chunk. */
-function buildUpstreamUrl(upstreamBase, { text, sl, tl, dj = 1 }) {
-  const url = new URL('/translate_a/single', upstreamBase);
-  url.searchParams.set('client', 'gtx');
+/** Build the upstream GET URL for one text chunk (client/path selectable). */
+function buildUpstreamUrl(upstreamBase, { text, sl, tl, dj = 1, client = 'gtx', path = '/translate_a/single' }) {
+  const url = new URL(path, upstreamBase);
+  url.searchParams.set('client', client);
   url.searchParams.set('sl', sl);
   url.searchParams.set('tl', tl);
-  url.searchParams.set('dt', 't');
-  url.searchParams.set('dj', String(dj));
+  if (dj) {
+    url.searchParams.set('dt', 't');
+    url.searchParams.set('dj', '1');
+  }
   url.searchParams.set('q', text);
   return url;
 }
@@ -121,7 +126,8 @@ function chunkText(text, max = DEFAULT_CHUNK_SIZE) {
 }
 
 /**
- * Parse one upstream payload (dj=1 object or legacy nested array) into
+ * Parse one upstream payload (dj=1 object, legacy nested array, or the flat
+ * dict-chrome-ex array [["translated","src"]]) into
  * { translatedText, detectedSourceLanguage, segmentCount }.
  */
 function parseUpstreamPayload(payload) {
@@ -129,7 +135,13 @@ function parseUpstreamPayload(payload) {
   let detected = null;
   if (Array.isArray(payload)) {
     const blocks = payload[0];
-    if (Array.isArray(blocks)) {
+    if (Array.isArray(blocks) && typeof blocks[0] === 'string') {
+      // flat dict-chrome-ex shape: [["translated text", "detected src"], ...]
+      for (const pair of payload) {
+        if (Array.isArray(pair) && typeof pair[0] === 'string') segments.push(pair[0]);
+      }
+      if (Array.isArray(payload[0]) && typeof payload[0][1] === 'string') detected = payload[0][1];
+    } else if (Array.isArray(blocks)) {
       for (const seg of blocks) {
         if (Array.isArray(seg) && typeof seg[0] === 'string') {
           segments.push(seg[0]);
@@ -156,7 +168,112 @@ function parseUpstreamPayload(payload) {
 }
 
 /**
- * Translate text by chunking it and querying upstream once per chunk.
+ * Upstream endpoint chain, tried in order until one answers. The classic
+ * client=gtx endpoint rate-limits datacenter IPs (HTTP 429) — the reason this
+ * chain exists. Each entry: which client param + path to use. When env
+ * UPSTREAM_BASE is set it overrides the host of every entry (mock testing).
+ */
+const UPSTREAM_ENDPOINTS = [
+  { client: 'at', path: '/translate_a/single', dj: 1 },
+  { client: 'dict-chrome-ex', path: '/translate_a/t', dj: 0 },
+  { client: 'gtx', path: '/translate_a/single', dj: 1 },
+];
+
+/** Browser-like headers; the gtx/at endpoints answer plain fetch() with 429 more often. */
+const UPSTREAM_HEADERS = {
+  accept: 'application/json, text/plain, */*',
+  'accept-language': 'en-US,en;q=0.9',
+  'user-agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  referer: 'https://translate.google.com/',
+};
+
+/** Statuses worth one backoff retry before falling to the next endpoint. */
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503]);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Translate one chunk through the endpoint chain: 2 attempts per endpoint
+ * (one backoff retry on 429/5xx/network errors) before moving on. Throws the
+ * most informative error when every endpoint fails; if all failures were
+ * HTTP 429 it throws UPSTREAM_RATE_LIMITED (a user-friendly rate-limit signal).
+ */
+async function translateChunkWithFallback(
+  fetchImpl,
+  { text, sl, tl, upstreamBase, timeoutMs, retryDelayMs = 250 },
+) {
+  let lastNonRateError = null;
+  let sawRateLimit = false;
+  for (const ep of UPSTREAM_ENDPOINTS) {
+    const url = buildUpstreamUrl(upstreamBase || DEFAULT_UPSTREAM_BASE, {
+      text,
+      sl,
+      tl,
+      dj: ep.dj,
+      client: ep.client,
+      path: ep.path,
+    });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) await sleep(retryDelayMs);
+      let res;
+      try {
+        res = await fetchImpl(url.toString(), {
+          method: 'GET',
+          headers: UPSTREAM_HEADERS,
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+      } catch (err) {
+        lastNonRateError = new HttpError(
+          'cannot reach translation upstream: ' + (err && err.message ? err.message : err),
+          { status: 502, code: 'UPSTREAM_UNREACHABLE' },
+        );
+        continue;
+      }
+      if (!res.ok) {
+        const err = new HttpError('translation upstream returned HTTP ' + res.status, {
+          status: 502,
+          code: 'UPSTREAM_HTTP_' + res.status,
+        });
+        if (res.status === 429) {
+          sawRateLimit = true;
+        } else {
+          lastNonRateError = err;
+        }
+        if (RETRYABLE_STATUS.has(res.status)) continue;
+        break;
+      }
+      let payload;
+      try {
+        payload = await res.json();
+      } catch {
+        lastNonRateError = new HttpError('translation upstream returned non-JSON body', {
+          status: 502,
+          code: 'UPSTREAM_BAD_BODY',
+        });
+        break;
+      }
+      try {
+        return parseUpstreamPayload(payload);
+      } catch (err) {
+        lastNonRateError = err;
+        break;
+      }
+    }
+  }
+  if (lastNonRateError) throw lastNonRateError;
+  if (sawRateLimit) {
+    throw new HttpError('translation upstream is rate limiting (HTTP 429), please retry in a few seconds', {
+      status: 503,
+      code: 'UPSTREAM_RATE_LIMITED',
+    });
+  }
+  throw new HttpError('translation upstream failed', { status: 502, code: 'UPSTREAM_ERROR' });
+}
+
+/**
+ * Translate text by chunking it and querying upstream once per chunk
+ * (each chunk walks the endpoint chain independently).
  * fetchImpl is injectable so tests never touch the network.
  */
 async function performTranslation(
@@ -165,9 +282,10 @@ async function performTranslation(
     text,
     sl = 'auto',
     tl,
-    upstreamBase = DEFAULT_UPSTREAM_BASE,
+    upstreamBase,
     chunkSize = DEFAULT_CHUNK_SIZE,
     timeoutMs = DEFAULT_TIMEOUT_MS,
+    retryDelayMs = 250,
   },
 ) {
   if (typeof text !== 'string' || !text.trim()) {
@@ -178,38 +296,16 @@ async function performTranslation(
   }
   const chunks = chunkText(text, chunkSize);
   const results = await Promise.all(
-    chunks.map(async (chunk) => {
-      const url = buildUpstreamUrl(upstreamBase, { text: chunk, sl, tl });
-      let res;
-      try {
-        res = await fetchImpl(url.toString(), {
-          method: 'GET',
-          headers: { accept: 'application/json' },
-          signal: AbortSignal.timeout(timeoutMs),
-        });
-      } catch (err) {
-        throw new HttpError('cannot reach translation upstream: ' + (err && err.message ? err.message : err), {
-          status: 502,
-          code: 'UPSTREAM_UNREACHABLE',
-        });
-      }
-      if (!res.ok) {
-        throw new HttpError('translation upstream returned HTTP ' + res.status, {
-          status: 502,
-          code: 'UPSTREAM_HTTP_' + res.status,
-        });
-      }
-      let payload;
-      try {
-        payload = await res.json();
-      } catch {
-        throw new HttpError('translation upstream returned non-JSON body', {
-          status: 502,
-          code: 'UPSTREAM_BAD_BODY',
-        });
-      }
-      return parseUpstreamPayload(payload);
-    }),
+    chunks.map((chunk) =>
+      translateChunkWithFallback(fetchImpl, {
+        text: chunk,
+        sl,
+        tl,
+        upstreamBase,
+        timeoutMs,
+        retryDelayMs,
+      }),
+    ),
   );
   return {
     translatedText: results.map((r) => r.translatedText).join(''),
@@ -572,6 +668,16 @@ const HTML = `<!doctype html>
     });
   }
 
+  var FRIENDLY_ERRORS = {
+    UPSTREAM_RATE_LIMITED: '翻译服务限流，请稍等约 1 分钟再试',
+    UPSTREAM_HTTP_429: '翻译服务限流，请稍等约 1 分钟再试',
+    UPSTREAM_UNREACHABLE: '翻译服务暂时不可用，请稍后重试',
+    UPSTREAM_BAD_BODY: '翻译服务返回异常，请稍后重试',
+    UPSTREAM_HTTP_502: '翻译服务暂时异常，请稍后重试',
+    UPSTREAM_HTTP_503: '翻译服务暂时异常，请稍后重试',
+    UPSTREAM_ERROR: '翻译服务异常，请稍后重试'
+  };
+
   function translate() {
     var text = src.value.trim();
     if (!text) { setStatus('请输入要翻译的文字', true); return; }
@@ -590,7 +696,10 @@ const HTML = `<!doctype html>
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ q: text, sl: sl, tl: tl })
     }).then(function (res) { return res.json(); }).then(function (body) {
-      if (!body.ok) { throw new Error((body.error && body.error.message) || 'translate failed'); }
+      if (!body.ok) {
+        var code = (body.error && body.error.code) || '';
+        throw new Error(FRIENDLY_ERRORS[code] || (body.error && body.error.message) || 'translate failed');
+      }
       out.textContent = body.data.translatedText;
       var det = body.data.detectedSourceLanguage;
       if (det && sl === 'auto') {
@@ -762,7 +871,7 @@ async function handleTranslate(request, cfg, url) {
     text,
     sl,
     tl,
-    upstreamBase: cfg.UPSTREAM_BASE || DEFAULT_UPSTREAM_BASE,
+    upstreamBase: cfg.UPSTREAM_BASE,
     timeoutMs: clampInt(cfg.UPSTREAM_TIMEOUT_MS, 500, 60000, DEFAULT_TIMEOUT_MS),
     chunkSize: cfg.CHUNK_SIZE ? clampInt(cfg.CHUNK_SIZE, 200, 5000, DEFAULT_CHUNK_SIZE) : undefined,
   });
@@ -787,39 +896,13 @@ async function handleDetect(request, cfg, url) {
   if (!text) {
     throw new HttpError('param "q" (text to detect) is required', { status: 400, code: 'BAD_REQUEST' });
   }
-  const upstream = buildUpstreamUrl(cfg.UPSTREAM_BASE || DEFAULT_UPSTREAM_BASE, {
+  const parsed = await translateChunkWithFallback(fetch, {
     text,
     sl: 'auto',
     tl: 'en',
-  }).toString();
-  let res;
-  try {
-    res = await fetch(upstream, {
-      headers: { accept: 'application/json' },
-      signal: AbortSignal.timeout(clampInt(cfg.UPSTREAM_TIMEOUT_MS, 500, 60000, DEFAULT_TIMEOUT_MS)),
-    });
-  } catch (err) {
-    throw new HttpError('cannot reach translation upstream: ' + (err && err.message ? err.message : err), {
-      status: 502,
-      code: 'UPSTREAM_UNREACHABLE',
-    });
-  }
-  if (!res.ok) {
-    throw new HttpError('translation upstream returned HTTP ' + res.status, {
-      status: 502,
-      code: 'UPSTREAM_HTTP_' + res.status,
-    });
-  }
-  let payload;
-  try {
-    payload = await res.json();
-  } catch {
-    throw new HttpError('translation upstream returned non-JSON body', {
-      status: 502,
-      code: 'UPSTREAM_BAD_BODY',
-    });
-  }
-  const parsed = parseUpstreamPayload(payload);
+    upstreamBase: cfg.UPSTREAM_BASE,
+    timeoutMs: clampInt(cfg.UPSTREAM_TIMEOUT_MS, 500, 60000, DEFAULT_TIMEOUT_MS),
+  });
   return json({ ok: true, data: { detectedSourceLanguage: parsed.detectedSourceLanguage } });
 }
 

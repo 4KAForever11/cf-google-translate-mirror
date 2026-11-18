@@ -1,6 +1,6 @@
 {
   "name": "cf-google-translate-mirror",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Single-file Google Translate mirror for Cloudflare Workers — paste workers.js into the dashboard and deploy. Web UI + JSON API, no API key required. / 单文件谷歌翻译镜像站，粘贴 workers.js 即可部署到 Cloudflare Workers，网页 + JSON API，无需 API Key。",
   "private": true,
   "type": "module",

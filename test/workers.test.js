@@ -120,6 +120,31 @@ test('buildUpstreamUrl targets the public gtx endpoint', () => {
   assert.equal(url.searchParams.get('q'), 'hello world');
 });
 
+test('buildUpstreamUrl supports alternate clients and paths', () => {
+  const at = buildUpstreamUrl('https://translate.googleapis.com', {
+    text: 'hi',
+    sl: 'auto',
+    tl: 'zh-CN',
+    client: 'at',
+  });
+  assert.equal(at.searchParams.get('client'), 'at');
+  assert.equal(at.searchParams.get('dj'), '1');
+
+  const dict = buildUpstreamUrl('https://clients5.google.com', {
+    text: 'hi',
+    sl: 'auto',
+    tl: 'zh-CN',
+    client: 'dict-chrome-ex',
+    path: '/translate_a/t',
+    dj: 0,
+  });
+  assert.equal(dict.origin + dict.pathname, 'https://clients5.google.com/translate_a/t');
+  assert.equal(dict.searchParams.get('client'), 'dict-chrome-ex');
+  assert.equal(dict.searchParams.get('dt'), null);
+  assert.equal(dict.searchParams.get('dj'), null);
+  assert.equal(dict.searchParams.get('q'), 'hi');
+});
+
 test('splitIntoUnits splits on sentence terminators and newlines', () => {
   assert.deepEqual(splitIntoUnits('Hello. 你好。World!\nBye?'), ['Hello.', ' 你好。', 'World!', '\n', 'Bye?']);
   assert.deepEqual(splitIntoUnits('no terminator'), ['no terminator']);
@@ -158,6 +183,13 @@ test('parseUpstreamPayload parses legacy nested array payload', () => {
   assert.equal(parsed.detectedSourceLanguage, 'en');
 });
 
+test('parseUpstreamPayload parses dict-chrome-ex flat array payload', () => {
+  const parsed = parseUpstreamPayload([['你好', 'en']]);
+  assert.equal(parsed.translatedText, '你好');
+  assert.equal(parsed.detectedSourceLanguage, 'en');
+  assert.equal(parsed.segmentCount, 1);
+});
+
 test('parseUpstreamPayload throws on empty translation', () => {
   assert.throws(() => parseUpstreamPayload({ sentences: [] }), (err) => {
     assert.ok(err instanceof HttpError);
@@ -178,17 +210,81 @@ test('performTranslation returns joined translation and detected language', asyn
   assert.equal(fetchImpl.calls[0].options.method, 'GET');
 });
 
-test('performTranslation classifies upstream HTTP errors', async () => {
-  const fetchImpl = fakeFetch(async () => new Response('nope', { status: 429 }));
+test('performTranslation classifies upstream HTTP errors after exhausting the chain', async () => {
+  const fetchImpl = fakeFetch(async () => new Response('nope', { status: 503 }));
   await assert.rejects(
-    () => performTranslation(fetchImpl, { text: 'hi', tl: 'fr' }),
+    () => performTranslation(fetchImpl, { text: 'hi', tl: 'fr', retryDelayMs: 1 }),
     (err) => {
       assert.ok(err instanceof HttpError);
-      assert.equal(err.code, 'UPSTREAM_HTTP_429');
+      assert.equal(err.code, 'UPSTREAM_HTTP_503');
       assert.equal(err.status, 502);
       return true;
     },
   );
+});
+
+test('performTranslation falls back to the next endpoint on 429', async () => {
+  const fetchImpl = fakeFetch(async (url) => {
+    const client = new URL(url).searchParams.get('client');
+    if (client === 'at' || client === 'dict-chrome-ex') return new Response('slow down', { status: 429 });
+    return gtx('hola');
+  });
+  const result = await performTranslation(fetchImpl, { text: 'hello', tl: 'es', retryDelayMs: 1 });
+  assert.equal(result.translatedText, 'hola');
+  assert.equal(fetchImpl.calls.length, 5); // at x2 + dict-chrome-ex x2 (429 retry) + gtx x1 (ok)
+  assert.equal(new URL(fetchImpl.calls.at(-1).url).searchParams.get('client'), 'gtx');
+});
+
+test('performTranslation retries the same endpoint once before falling back', async () => {
+  let attempts = 0;
+  const fetchImpl = fakeFetch(async () => {
+    attempts += 1;
+    return new Response('busy', { status: 429 });
+  });
+  await assert.rejects(
+    () => performTranslation(fetchImpl, { text: 'hi', tl: 'fr', retryDelayMs: 1 }),
+    (err) => {
+      assert.equal(err.code, 'UPSTREAM_RATE_LIMITED');
+      assert.equal(err.status, 503);
+      return true;
+    },
+  );
+  assert.equal(attempts, 6); // 3 endpoints x 2 attempts
+});
+
+test('performTranslation reports UPSTREAM_RATE_LIMITED when every endpoint 429s', async () => {
+  const fetchImpl = fakeFetch(async () => new Response('Sorry', { status: 429 }));
+  await assert.rejects(
+    () => performTranslation(fetchImpl, { text: 'hi', tl: 'fr', retryDelayMs: 1 }),
+    (err) => {
+      assert.ok(err instanceof HttpError);
+      assert.equal(err.code, 'UPSTREAM_RATE_LIMITED');
+      assert.equal(err.status, 503);
+      return true;
+    },
+  );
+});
+
+test('performTranslation prefers a non-429 error over the rate-limit signal', async () => {
+  const fetchImpl = fakeFetch(async (url) => {
+    const client = new URL(url).searchParams.get('client');
+    return client === 'gtx' ? new Response('boom', { status: 500 }) : new Response('nope', { status: 429 });
+  });
+  await assert.rejects(
+    () => performTranslation(fetchImpl, { text: 'hi', tl: 'fr', retryDelayMs: 1 }),
+    (err) => {
+      assert.equal(err.code, 'UPSTREAM_HTTP_500');
+      return true;
+    },
+  );
+});
+
+test('performTranslation sends browser-like upstream headers', async () => {
+  const fetchImpl = fakeFetch(async () => gtx('hola'));
+  await performTranslation(fetchImpl, { text: 'hello', tl: 'es' });
+  const headers = fetchImpl.calls[0].options.headers;
+  assert.match(headers['user-agent'], /Mozilla/);
+  assert.equal(headers.referer, 'https://translate.google.com/');
 });
 
 test('performTranslation validates inputs before any fetch', async () => {

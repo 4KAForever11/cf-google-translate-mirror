@@ -18,9 +18,10 @@
 | 🌍 **Web UI** | Clean two-pane translator with auto language detection, swap, copy, and text-to-speech |
 | 📡 **JSON API** | `POST /api/translate` (also `GET`), `/api/detect`, `/api/languages` with CORS enabled |
 | 🔑 **No API Key** | Uses the public Google Translate web endpoint — no billing, no secrets |
+| 🛡 **Rate-limit Fallback** | Rotates across upstream endpoints (`client=at` → `dict-chrome-ex` → `client=gtx`) with backoff retries when one gets HTTP 429 |
 | ⚡ **Edge Speed** | Runs on Cloudflare's global edge network, milliseconds away from users |
 | 📦 **Zero DB** | Stateless design — nothing stored, nothing tracked |
-| 🧪 **Tested** | 28 tests (unit + route behavior + entry constraints), CI on every push |
+| 🧪 **Tested** | 35 tests (unit + route behavior + entry constraints), CI on every push |
 | 🎨 **Dark Mode** | Automatic `prefers-color-scheme` support |
 
 ## 🚀 Quick Start
@@ -59,6 +60,8 @@ npm run dev
 ## 📡 API Reference
 
 All endpoints return JSON and allow CORS (`*`). Errors share one shape: `{ "ok": false, "error": { "code": "...", "message": "..." } }`.
+
+Common error codes: `BAD_REQUEST` (missing/invalid params, 400; too long, 413), `NOT_FOUND` (404), `UPSTREAM_RATE_LIMITED` (503 — every upstream endpoint is rate limiting; retry in a minute), `UPSTREAM_HTTP_<status>` (502 — upstream kept failing), `UPSTREAM_UNREACHABLE` (502), `UPSTREAM_BAD_BODY` (502).
 
 ### `POST /api/translate` (recommended)
 
@@ -130,7 +133,7 @@ All settings have safe defaults baked into `workers.js`. To override them, set e
 ## 🧪 Testing
 
 ```bash
-npm test        # 28 tests (node:test): unit + route behavior + entry constraints
+npm test        # 35 tests (node:test): unit + route behavior + entry constraints
 npm run lint    # syntax check all sources
 npm run mock    # local mock upstream on :9999 (offline e2e)
 npm run smoke   # post-deploy smoke test: node scripts/smoke.mjs https://<your-worker>
@@ -152,6 +155,9 @@ cf-google-translate-mirror/
 ```
 
 ## ❓ FAQ
+
+**Why did I get `translation upstream ... 429`?**
+The public Google Translate endpoints rate-limit datacenter IPs. The Worker already mitigates this: it rotates across three upstream endpoints (`client=at` → `dict-chrome-ex` → `client=gtx`) with one backoff retry each, and reports `UPSTREAM_RATE_LIMITED` only when every endpoint is throttled. If that happens, wait ~1 minute and retry — or set `UPSTREAM_BASE` to your own backend.
 
 **Why does long text sometimes take longer?**
 Texts over ~1000 chars are split into chunks (sentence-aware) and translated per chunk to stay within upstream URL limits, then reassembled. The response's `chunkCount` tells you how many upstream calls were made.

@@ -18,9 +18,10 @@
 | 🌍 **网页界面** | 双栏翻译界面：自动检测语种、语种互换、复制、朗读 |
 | 📡 **JSON API** | `POST /api/translate`（也支持 `GET`）、`/api/detect`、`/api/languages`，已开启 CORS |
 | 🔑 **无需 API Key** | 使用谷歌翻译公开网页接口 —— 不计费、不存密钥 |
+| 🛡 **限流自动回退** | 上游端点轮换（`client=at` → `dict-chrome-ex` → `client=gtx`）+ 退避重试，单个端点 429 不再直接失败 |
 | ⚡ **边缘速度** | 运行在 Cloudflare 全球边缘网络，毫秒级触达用户 |
 | 📦 **零数据库** | 无状态设计 —— 不存储、不追踪 |
-| 🧪 **完整测试** | 28 个测试（单元 + 路由行为 + 入口约束），每次推送均跑 CI |
+| 🧪 **完整测试** | 35 个测试（单元 + 路由行为 + 入口约束），每次推送均跑 CI |
 | 🎨 **暗色模式** | 自动跟随 `prefers-color-scheme` |
 
 ## 🚀 快速开始
@@ -59,6 +60,8 @@ npm run dev
 ## 📡 API 文档
 
 所有接口返回 JSON 并允许 CORS（`*`）。错误统一格式：`{ "ok": false, "error": { "code": "...", "message": "..." } }`。
+
+常见错误码：`BAD_REQUEST`（参数缺失/非法，400；文本超长，413）、`NOT_FOUND`（404）、`UPSTREAM_RATE_LIMITED`（503 —— 所有上游端点都在限流，约 1 分钟后重试）、`UPSTREAM_HTTP_<状态码>`（502 —— 上游持续失败）、`UPSTREAM_UNREACHABLE`（502）、`UPSTREAM_BAD_BODY`（502）。
 
 ### `POST /api/translate`（推荐）
 
@@ -130,7 +133,7 @@ curl -X POST "https://YOUR-WORKER.workers.dev/api/translate" \
 ## 🧪 测试
 
 ```bash
-npm test        # 28 个测试（node:test）：单元 + 路由行为 + 入口约束
+npm test        # 35 个测试（node:test）：单元 + 路由行为 + 入口约束
 npm run lint    # 语法检查全部源码
 npm run mock    # 本地 mock 上游（:9999，离线 e2e 用）
 npm run smoke   # 部署后冒烟测试：node scripts/smoke.mjs https://<你的-worker>
@@ -152,6 +155,9 @@ cf-google-translate-mirror/
 ```
 
 ## ❓ 常见问题
+
+**为什么报 `translation upstream ... 429`？**
+谷歌翻译公开接口会对机房 IP 限流。Worker 已内置缓解：自动轮换三个上游端点（`client=at` → `dict-chrome-ex` → `client=gtx`），每个端点失败后退避重试一次；只有全部端点都被限流时才返回 `UPSTREAM_RATE_LIMITED`。遇到时请等待约 1 分钟重试 —— 或设置 `UPSTREAM_BASE` 指向自建后端。
 
 **为什么长文本有时比较慢？**
 超过约 1000 字符的文本会按句子感知地拆成多个分块逐块翻译（避免超出上游 URL 长度限制），然后重新拼接。响应中的 `chunkCount` 表示实际发起了多少次上游请求。

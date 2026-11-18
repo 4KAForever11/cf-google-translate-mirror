@@ -19,7 +19,7 @@ npm run dev        # local dev server (wrangler dev)
 
 ### Before you open a PR
 
-1. Run unit tests: `npm test` — all 28 tests must pass.
+1. Run unit tests: `npm test` — all 35 tests must pass.
 2. Run lint: `npm run lint`.
 3. Run the dry-run build: `npx wrangler deploy --dry-run --outdir=dist`.
 4. Update **both** `README.md` and `README.zh-CN.md` if your change is user-facing.
@@ -56,7 +56,7 @@ npm run dev        # 本地开发服务器（wrangler dev）
 
 ### 提交 PR 前
 
-1. 跑单测：`npm test` —— 28 个测试必须全部通过。
+1. 跑单测：`npm test` —— 35 个测试必须全部通过。
 2. 语法检查：`npm run lint`。
 3. 构建验证：`npx wrangler deploy --dry-run --outdir=dist`。
 4. 如果改动影响用户可见行为，请**同步更新** `README.md` 与 `README.zh-CN.md`。
