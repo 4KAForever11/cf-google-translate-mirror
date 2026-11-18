@@ -1,0 +1,37 @@
+{
+  "name": "cf-google-translate-mirror",
+  "version": "1.0.0",
+  "description": "Google Translate mirror powered by Cloudflare Workers — web UI + JSON API, no API key required. / 基于 Cloudflare Workers 的谷歌翻译镜像站，网页 + JSON API，无需 API Key。",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/4KAForever11/cf-google-translate-mirror.git"
+  },
+  "keywords": [
+    "cloudflare-workers",
+    "google-translate",
+    "translation",
+    "proxy",
+    "mirror"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test",
+    "lint": "node --check src/index.js && node --check src/google.js && node --check src/languages.js",
+    "build:check": "wrangler deploy --dry-run --outdir=dist",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.60.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "workerd@1.20261117.1": true
+  }
+}

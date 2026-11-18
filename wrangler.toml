@@ -1,0 +1,27 @@
+# Cloudflare Worker configuration
+# Docs: https://developers.cloudflare.com/workers/wrangler/configuration/
+
+name = "cf-google-translate-mirror"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+
+# Serve the frontend from ./public as static assets alongside the Worker.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+# Optional environment variables (defaults are used when absent).
+# UPSTREAM_BASE      — override the upstream endpoint for testing.
+# MAX_TEXT_LENGTH    — max chars per translate request (default 5000).
+# UPSTREAM_TIMEOUT_MS — upstream fetch timeout in ms (default 10000).
+# CHUNK_SIZE         — chars per upstream chunk (default 1000).
+[vars]
+MAX_TEXT_LENGTH = "5000"
+UPSTREAM_TIMEOUT_MS = "10000"
+
+# Uncomment to pin an upstream (useful for self-hosted translation backends):
+# [vars]
+# UPSTREAM_BASE = "https://translate.googleapis.com"
+
+[observability]
+enabled = true
